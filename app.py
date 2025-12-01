@@ -21,8 +21,7 @@ SD_IMG2IMG_MODEL_ID = (
 
 # ControlNet canny model (structure-controlled run)
 # You can pin a specific version later if you like; this uses latest.
-CONTROLNET_MODEL_ID = "cazwaz/controlnet-canny"
-
+CONTROLNET_MODEL_ID = "jagilley/controlnet-canny:aff48af9c68d162388d230a2ab003f68d2638d88307bdaf1c2f1ac95079c9613"
 
 def get_replicate_token() -> Optional[str]:
     """Resolve Replicate API token from Streamlit secrets or env."""
@@ -171,64 +170,45 @@ def call_controlnet_canny(
     prompt: str,
     guidance_scale: float,
     steps: int,
-    num_outputs: int = 3,
+    num_outputs: int = 3,   # Not used by this model, but we keep the signature
 ) -> List[Image.Image]:
     """
-    ControlNet Canny run using the cazwaz/controlnet-canny model on Replicate.
-
-    We treat the selected structural prior (Canny / Silhouette / Hybrid)
-    as the control image. This model expects:
-      - image (canny-like or structural map)
-      - prompt
-      - num_outputs
-      - guidance_scale
-      - image_resolution
-      - low_threshold, high_threshold
-
-    NOTE: 'steps' is not exposed in this particular model's schema,
-    so we ignore it here to avoid 400/422 errors.
+    ControlNet call for jagilley/controlnet-canny:<hash>.
+    NOTE: This version ONLY accepts:
+        - image
+        - prompt
+    It ignores steps, guidance, and num_outputs.
     """
     ensure_replicate_token()
 
-    # Prepare control image as PNG buffer
+    # Prepare image buffer
     control_image = resize_to_512(control_image)
     img_buf = pil_to_bytes_io(control_image)
 
-    # Call ControlNet model
+    # Only two parameters allowed!
     response = replicate.run(
-        CONTROLNET_MODEL_ID,
+        CONTROLNET_MODEL_ID,      # set below
         input={
             "image": img_buf,
             "prompt": prompt,
-            "num_outputs": num_outputs,
-            "guidance_scale": guidance_scale,
-            "image_resolution": 512,
-            "low_threshold": 100,
-            "high_threshold": 200,
         },
     )
 
-    # Normalise response → list of URL strings
+    # Normalize response
     if isinstance(response, dict):
         urls = response.get("output", [])
     else:
         urls = response
 
     if not urls:
-        raise RuntimeError("ControlNet returned no output URLs.")
+        raise RuntimeError("ControlNet returned no images.")
 
-    images: List[Image.Image] = []
+    images = []
     for url in urls:
-        try:
-            r = requests.get(str(url))
-            r.raise_for_status()
-            img = Image.open(io.BytesIO(r.content)).convert("RGB")
-            images.append(img)
-        except Exception as e:
-            st.warning(f"Failed to download ControlNet image from {url}: {e}")
-
-    if not images:
-        raise RuntimeError("Failed to download any ControlNet outputs.")
+        r = requests.get(str(url))
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        images.append(img)
 
     return images
 
