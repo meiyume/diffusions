@@ -12,8 +12,7 @@ import replicate
 # Config – Replicate model + token
 # ------------------------------
 # Public Stable Diffusion img2img model on Replicate
-REPLICATE_MODEL_ID = "stability-ai/stable-diffusion-img2img"
-
+REPLICATE_MODEL_ID = "stability-ai/stable-diffusion-img2img:15a3689ee13b0d2616e98820eca31d4c3abcd36672df6afce5cb6feb1d66087d"
 
 def get_replicate_token() -> Optional[str]:
     """
