@@ -1,4 +1,6 @@
 streamlit
+replicate
+opencv-python-headless
+numpy
 Pillow
 requests
-replicate
