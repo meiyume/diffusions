@@ -21,7 +21,7 @@ SD_IMG2IMG_MODEL_ID = (
 
 # ControlNet canny model (structure-controlled run)
 # You can pin a specific version later if you like; this uses latest.
-CONTROLNET_MODEL_ID = "jagilley/controlnet-canny"
+CONTROLNET_MODEL_ID = "cazwaz/controlnet-canny"
 
 
 def get_replicate_token() -> Optional[str]:
@@ -231,6 +231,7 @@ def call_controlnet_canny(
         raise RuntimeError("Failed to download any ControlNet outputs.")
 
     return images
+
 
 
 # ------------------------------
