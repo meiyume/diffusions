@@ -1,35 +1,37 @@
 import os
 import io
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
 import streamlit as st
 from PIL import Image
 import replicate
-
+import numpy as np
+import cv2
 
 # ------------------------------
-# Config – Replicate model + token
+# Replicate model IDs & token
 # ------------------------------
-# Public Stable Diffusion img2img model on Replicate
-REPLICATE_MODEL_ID = "stability-ai/stable-diffusion-img2img:15a3689ee13b0d2616e98820eca31d4c3abcd36672df6afce5cb6feb1d66087d"
+
+# Your existing vanilla SD img2img model (uncontrolled baseline)
+SD_IMG2IMG_MODEL_ID = (
+    "stability-ai/stable-diffusion-img2img:"
+    "15a3689ee13b0d2616e98820eca31d4c3abcd36672df6afce5cb6feb1d66087d"
+)
+
+# ControlNet canny model (structure-controlled run)
+# You can pin a specific version later if you like; this uses latest.
+CONTROLNET_MODEL_ID = "jagilley/controlnet-canny"
+
 
 def get_replicate_token() -> Optional[str]:
-    """
-    Resolve the Replicate API token.
-    Priority:
-    1. Streamlit secrets (REPLICATE_API_TOKEN)
-    2. Environment variable REPLICATE_API_TOKEN
-    """
+    """Resolve Replicate API token from Streamlit secrets or env."""
     token = None
-
-    # Try Streamlit secrets (Streamlit Cloud: Settings -> Secrets)
     try:
         token = st.secrets.get("REPLICATE_API_TOKEN", None)
     except Exception:
         token = None
 
-    # Fallback to environment variable
     if not token:
         token = os.getenv("REPLICATE_API_TOKEN")
 
@@ -37,7 +39,7 @@ def get_replicate_token() -> Optional[str]:
 
 
 # ------------------------------
-# Utility functions
+# Image utilities
 # ------------------------------
 def load_image(uploaded_file) -> Optional[Image.Image]:
     if uploaded_file is None:
@@ -47,7 +49,6 @@ def load_image(uploaded_file) -> Optional[Image.Image]:
 
 
 def resize_to_512(img: Image.Image) -> Image.Image:
-    # Simple center-ish resize; for PoC this is fine
     return img.resize((512, 512))
 
 
@@ -58,41 +59,79 @@ def pil_to_bytes_io(img: Image.Image) -> io.BytesIO:
     return buf
 
 
-# ------------------------------
-# Replicate diffusion call
-# ------------------------------
-def generate_thermo_variants(
-    base_image: Image.Image,
-    prompt: str,
-    strength: float = 0.6,
-    guidance_scale: float = 7.5,
-    steps: int = 20,
-    num_outputs: int = 3,
-) -> List[Image.Image]:
+def compute_structural_priors(
+    img: Image.Image,
+) -> Tuple[Image.Image, Image.Image, Image.Image]:
     """
-    Call Replicate's Stable Diffusion img2img model with Image B (thermography)
-    and return a list of PIL Images (synthetic variants).
-    Handles both:
-    - plain list of URLs (common case for replicate.run)
-    - full prediction dict with an 'output' field
+    From thermography image B, compute:
+      - Canny edges
+      - Silhouette mask
+      - Hybrid (edges within silhouette)
+
+    Returned as 512x512 single-channel PIL images.
     """
+    img_resized = resize_to_512(img)
+    img_np = np.array(img_resized)
+
+    # grayscale
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+    # ---- Canny edges ----
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    # ---- Silhouette via Otsu + largest contour ----
+    _, mask = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    silhouette = np.zeros_like(mask)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        cv2.drawContours(silhouette, [largest], -1, 255, thickness=-1)
+
+    # ---- Hybrid: edges restricted to silhouette ----
+    hybrid = cv2.bitwise_and(edges, edges, mask=silhouette)
+
+    canny_pil = Image.fromarray(edges)
+    silhouette_pil = Image.fromarray(silhouette)
+    hybrid_pil = Image.fromarray(hybrid)
+
+    return canny_pil, silhouette_pil, hybrid_pil
+
+
+# ------------------------------
+# Replicate helpers
+# ------------------------------
+def ensure_replicate_token() -> str:
     token = get_replicate_token()
     if not token:
         raise RuntimeError(
             "REPLICATE_API_TOKEN is not set. "
-            "Please configure it in Streamlit Secrets or as an environment variable."
+            "Add it in Streamlit Secrets or as an environment variable."
         )
-
-    # Replicate Python client reads this env var
     os.environ["REPLICATE_API_TOKEN"] = token
+    return token
 
-    # Prepare image buffer (file-like object) for Replicate
+
+def call_sd_img2img(
+    base_image: Image.Image,
+    prompt: str,
+    strength: float,
+    guidance_scale: float,
+    steps: int,
+    num_outputs: int = 3,
+) -> List[Image.Image]:
+    """Vanilla SD img2img (uncontrolled baseline)."""
+    ensure_replicate_token()
+
     base_image = resize_to_512(base_image)
     img_buf = pil_to_bytes_io(base_image)
 
-    # Call Replicate
     response = replicate.run(
-        REPLICATE_MODEL_ID,
+        SD_IMG2IMG_MODEL_ID,
         input={
             "image": img_buf,
             "prompt": prompt,
@@ -103,48 +142,118 @@ def generate_thermo_variants(
         },
     )
 
-    # Normalise response → list of URL strings
     if isinstance(response, dict):
         urls = response.get("output", [])
     else:
         urls = response
 
     if not urls:
-        raise RuntimeError("Replicate returned no output URLs.")
+        raise RuntimeError("SD img2img returned no output URLs.")
 
     images: List[Image.Image] = []
     for url in urls:
         try:
-            # Expect each item to be a URL string
-            resp = requests.get(str(url))
-            resp.raise_for_status()
-            img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            r = requests.get(str(url))
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
             images.append(img)
         except Exception as e:
-            # Non-fatal: just skip broken URLs but warn in UI
-            st.warning(f"Failed to load image from {url}: {e}")
+            st.warning(f"Failed to download image from {url}: {e}")
 
     if not images:
-        raise RuntimeError("Failed to download any images from Replicate output URLs.")
+        raise RuntimeError("Failed to download any SD img2img outputs.")
 
     return images
 
+
+def call_controlnet_canny(
+    control_image: Image.Image,
+    prompt: str,
+    guidance_scale: float,
+    steps: int,
+    num_outputs: int = 3,
+) -> List[Image.Image]:
+    """
+    ControlNet Canny run.
+
+    Here we treat the selected structural prior (Canny / Silhouette / Hybrid)
+    as the control image. The ControlNet model expects an `image` + `prompt`
+    plus optional knobs like thresholds, scale, steps, etc.
+
+    If you get schema errors from Replicate, check the model's API page
+    and tweak the keys in `input` accordingly.
+    """
+    ensure_replicate_token()
+
+    control_image = resize_to_512(control_image)
+    img_buf = pil_to_bytes_io(control_image)
+
+    # ControlNet parameters based on common jagilley/controlnet-canny schema.
+    response = replicate.run(
+        CONTROLNET_MODEL_ID,
+        input={
+            "image": img_buf,
+            "prompt": prompt,
+            "image_resolution": 512,
+            "ddim_steps": steps,
+            "scale": guidance_scale,
+            "num_samples": num_outputs,
+            "low_threshold": 100,
+            "high_threshold": 200,
+            "guess_mode": False,
+        },
+    )
+
+    if isinstance(response, dict):
+        urls = response.get("output", [])
+    else:
+        urls = response
+
+    if not urls:
+        raise RuntimeError("ControlNet returned no output URLs.")
+
+    images: List[Image.Image] = []
+    for url in urls:
+        try:
+            r = requests.get(str(url))
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+            images.append(img)
+        except Exception as e:
+            st.warning(f"Failed to download ControlNet image from {url}: {e}")
+
+    if not images:
+        raise RuntimeError("Failed to download any ControlNet outputs.")
+
+    return images
+
+
 # ------------------------------
-# Streamlit UI
+# Streamlit app
 # ------------------------------
 def main():
     st.set_page_config(
-        page_title="Thermography Diffusion (Replicate)",
+        page_title="Thermography · SD img2img + ControlNet",
         layout="wide",
     )
 
-    st.title("🩺 Thermography Augmentation via Diffusion (Replicate API)")
+    st.title("🩺 Thermography Diffusion: Uncontrolled vs ControlNet-Guided")
     st.caption(
-        "Upload Image A (mammogram, reference) and Image B (thermography, base). "
-        "This app uses Replicate's Stable Diffusion img2img model to generate "
-        "three synthetic variants of Image B.\n\n"
-        "⚠️ Research/demo only – not for clinical diagnosis."
+        "Upload mammogram (A) and thermography (B). "
+        "First we run vanilla Stable Diffusion img2img on B (uncontrolled). "
+        "Then we derive structural priors (Canny / Silhouette / Hybrid) from B, "
+        "let you pick one as a ControlNet conditioning image, and run a second, "
+        "structure-guided generation.\n\n"
+        "⚠️ Research demo only – not for clinical use."
     )
+
+    # Session storage
+    if "uncontrolled_images" not in st.session_state:
+        st.session_state["uncontrolled_images"] = None
+    if "controlled_images" not in st.session_state:
+        st.session_state["controlled_images"] = None
+    if "priors" not in st.session_state:
+        st.session_state["priors"] = None  # (canny, silhouette, hybrid)
 
     token_present = bool(get_replicate_token())
     with st.expander("Replicate configuration", expanded=False):
@@ -152,42 +261,43 @@ def main():
             st.success("REPLICATE_API_TOKEN detected ✅")
         else:
             st.warning(
-                "REPLICATE_API_TOKEN is not set. Go to Streamlit Cloud → Settings → Secrets and add:\n\n"
+                "REPLICATE_API_TOKEN is not set. "
+                "On Streamlit Cloud: Settings → Secrets → add\n"
                 "REPLICATE_API_TOKEN = \"r8_...\""
             )
 
-    # Layout for uploads
+    # ------------------ Uploads ------------------
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.subheader("Image A: Mammogram (reference)")
+        st.subheader("Image A: Mammogram (optional)")
         file_a = st.file_uploader(
-            "Upload Image A (optional)", type=["png", "jpg", "jpeg"], key="image_a"
+            "Upload Image A", type=["png", "jpg", "jpeg"], key="image_a"
         )
         img_a = load_image(file_a)
         if img_a is not None:
             st.image(img_a, caption="Image A (Mammogram)", width=256)
         else:
-            st.info("Image A is optional and used only for display/context.")
+            st.info("Image A is optional and only for context.")
 
     with col_b:
-        st.subheader("Image B: Thermography (base)")
+        st.subheader("Image B: Thermography (required)")
         file_b = st.file_uploader(
-            "Upload Image B (required)", type=["png", "jpg", "jpeg"], key="image_b"
+            "Upload Image B", type=["png", "jpg", "jpeg"], key="image_b"
         )
         img_b = load_image(file_b)
         if img_b is not None:
             st.image(img_b, caption="Image B (Thermography Base)", width=256)
         else:
-            st.warning("Please upload Image B. This is the image used for diffusion.")
+            st.error("Please upload Image B – it is required for all generation.")
 
     st.markdown("---")
 
-    # Generation controls
-    st.subheader("Generation settings")
+    # ------------------ Shared diffusion settings ------------------
+    st.subheader("Diffusion settings (used for both runs)")
 
     prompt = st.text_area(
-        "Prompt guiding the synthetic thermography:",
+        "Prompt:",
         value=(
             "medical breast thermography heatmap, realistic, high quality, "
             "consistent anatomy, clean clinical style"
@@ -195,71 +305,171 @@ def main():
         height=80,
     )
 
-    col_s1, col_s2, col_s3 = st.columns(3)
-    with col_s1:
+    c1, c2, c3 = st.columns(3)
+    with c1:
         strength = st.slider(
-            "Transformation strength",
-            min_value=0.1,
-            max_value=0.9,
-            value=0.6,
-            step=0.05,
-            help="0.1 = very subtle change, 0.9 = strong transformation from the base image.",
+            "img2img strength (for SD img2img baseline)",
+            0.1,
+            0.9,
+            0.6,
+            0.05,
+            help="Only affects the *uncontrolled* SD img2img run.",
         )
-    with col_s2:
+    with c2:
         guidance_scale = st.slider(
-            "Guidance scale",
-            min_value=3.0,
-            max_value=15.0,
-            value=7.5,
-            step=0.5,
-            help="Higher values make the output follow the text prompt more strongly.",
+            "Guidance / scale",
+            3.0,
+            15.0,
+            7.5,
+            0.5,
+            help="Higher = follow text more closely.",
         )
-    with col_s3:
+    with c3:
         steps = st.slider(
-            "Diffusion steps",
-            min_value=10,
-            max_value=50,
-            value=20,
-            step=5,
-            help="More steps can improve quality but are slower and cost more on Replicate.",
+            "Steps (SD + ControlNet)",
+            10,
+            50,
+            20,
+            5,
+            help="More steps = potentially better, but slower and more cost.",
         )
 
     st.markdown("---")
 
-    generate_btn = st.button("🚀 Generate 3 synthetic thermography images")
+    # ------------------ 1) Uncontrolled SD img2img ------------------
+    st.subheader("① Uncontrolled diffusion (Image B → SD img2img)")
 
-    if generate_btn:
+    if st.button("🚀 Generate 3 uncontrolled images"):
         if img_b is None:
-            st.error("Please upload Image B (thermography) before generating.")
-            return
+            st.error("Upload Image B first.")
+        elif not token_present:
+            st.error("REPLICATE_API_TOKEN is not configured.")
+        else:
+            with st.spinner("Running vanilla SD img2img on Image B…"):
+                try:
+                    imgs = call_sd_img2img(
+                        base_image=img_b,
+                        prompt=prompt,
+                        strength=strength,
+                        guidance_scale=guidance_scale,
+                        steps=steps,
+                        num_outputs=3,
+                    )
+                    st.session_state["uncontrolled_images"] = imgs
+                except Exception as e:
+                    st.error(f"Uncontrolled generation failed: {e}")
 
-        if not token_present:
-            st.error(
-                "REPLICATE_API_TOKEN is not configured. "
-                "Please set it in Streamlit Secrets or as an environment variable."
-            )
-            return
-
-        with st.spinner("Calling Replicate and generating images…"):
-            try:
-                images = generate_thermo_variants(
-                    base_image=img_b,
-                    prompt=prompt,
-                    strength=strength,
-                    guidance_scale=guidance_scale,
-                    steps=steps,
-                    num_outputs=3,
-                )
-            except Exception as e:
-                st.error(f"Generation failed: {e}")
-                return
-
-        st.success("Done! Here are the 3 synthetic variants of Image B:")
+    if st.session_state["uncontrolled_images"]:
         cols = st.columns(3)
-        for col, img in zip(cols, images):
+        for col, img in zip(cols, st.session_state["uncontrolled_images"]):
             with col:
                 st.image(img, width=256)
+    else:
+        st.info("No uncontrolled images yet. Click the button above to generate them.")
+
+    # ------------------ 2) Structural priors from Image B ------------------
+    st.markdown("---")
+    st.subheader("② Structural priors from Image B (for ControlNet conditioning)")
+
+    if img_b is not None:
+        if st.session_state["priors"] is None:
+            try:
+                canny_img, silhouette_img, hybrid_img = compute_structural_priors(img_b)
+                st.session_state["priors"] = (canny_img, silhouette_img, hybrid_img)
+            except Exception as e:
+                st.error(f"Failed to compute structural priors: {e}")
+                st.session_state["priors"] = None
+
+        priors = st.session_state["priors"]
+        if priors is not None:
+            canny_img, silhouette_img, hybrid_img = priors
+
+            pc1, pc2, pc3 = st.columns(3)
+            with pc1:
+                st.image(canny_img, caption="Canny edge map", clamp=True, width=256)
+            with pc2:
+                st.image(
+                    silhouette_img,
+                    caption="Silhouette mask",
+                    clamp=True,
+                    width=256,
+                )
+            with pc3:
+                st.image(
+                    hybrid_img,
+                    caption="Hybrid (edges × silhouette)",
+                    clamp=True,
+                    width=256,
+                )
+
+            st.caption(
+                "These are 512×512 structural priors derived from Image B. "
+                "ControlNet-canny is trained on canny edges, but you can also try "
+                "silhouette or hybrid as conditioning inputs."
+            )
+
+            # ------------------ 3) Choose control image & run ControlNet ------------------
+            st.subheader("③ Controlled diffusion via ControlNet-Canny")
+
+            choice = st.radio(
+                "Choose which structural prior to use as the ControlNet conditioning image:",
+                [
+                    "Canny edge map (recommended)",
+                    "Silhouette mask",
+                    "Hybrid (edges × silhouette)",
+                ],
+                index=0,
+            )
+
+            if choice.startswith("Canny"):
+                control_base = canny_img
+            elif choice.startswith("Silhouette"):
+                control_base = silhouette_img
+            else:
+                control_base = hybrid_img
+
+            if st.button("🎯 Generate 3 controlled images (ControlNet)"):
+                if not token_present:
+                    st.error("REPLICATE_API_TOKEN is not configured.")
+                else:
+                    with st.spinner("Running ControlNet-Canny with selected control image…"):
+                        try:
+                            imgs = call_controlnet_canny(
+                                control_image=control_base,
+                                prompt=prompt,
+                                guidance_scale=guidance_scale,
+                                steps=steps,
+                                num_outputs=3,
+                            )
+                            st.session_state["controlled_images"] = imgs
+                        except Exception as e:
+                            st.error(f"ControlNet generation failed: {e}")
+        else:
+            st.info("Structural priors not available.")
+    else:
+        st.info("Upload Image B to compute structural priors and run ControlNet.")
+
+    # ------------------ 4) Show controlled images at the bottom ------------------
+    st.markdown("---")
+    st.subheader("④ Controlled images (ControlNet output)")
+
+    if st.session_state["controlled_images"]:
+        cols2 = st.columns(3)
+        for col, img in zip(cols2, st.session_state["controlled_images"]):
+            with col:
+                st.image(img, width=256)
+        st.caption(
+            "These images are generated by the ControlNet-Canny model on Replicate, "
+            "conditioned on the chosen structural prior from Image B. "
+            "Compare them to the uncontrolled SD img2img outputs above."
+        )
+    else:
+        st.info(
+            "No controlled images yet. Choose a structural prior above and click the "
+            "ControlNet generate button."
+        )
 
 
 if __name__ == "__main__":
     main()
+
