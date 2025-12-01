@@ -166,7 +166,7 @@ def main():
         )
         img_a = load_image(file_a)
         if img_a is not None:
-            st.image(img_a, caption="Image A (Mammogram)", use_column_width=True)
+            st.image(img_a, caption="Image A (Mammogram)", width=256)
         else:
             st.info("Image A is optional and used only for display/context.")
 
@@ -177,7 +177,7 @@ def main():
         )
         img_b = load_image(file_b)
         if img_b is not None:
-            st.image(img_b, caption="Image B (Thermography Base)", use_column_width=True)
+            st.image(img_b, caption="Image B (Thermography Base)", width=256)
         else:
             st.warning("Please upload Image B. This is the image used for diffusion.")
 
@@ -258,7 +258,7 @@ def main():
         cols = st.columns(3)
         for col, img in zip(cols, images):
             with col:
-                st.image(img, use_column_width=True)
+                st.image(img, width=256)
 
 
 if __name__ == "__main__":
