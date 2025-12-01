@@ -174,36 +174,41 @@ def call_controlnet_canny(
     num_outputs: int = 3,
 ) -> List[Image.Image]:
     """
-    ControlNet Canny run.
+    ControlNet Canny run using the cazwaz/controlnet-canny model on Replicate.
 
-    Here we treat the selected structural prior (Canny / Silhouette / Hybrid)
-    as the control image. The ControlNet model expects an `image` + `prompt`
-    plus optional knobs like thresholds, scale, steps, etc.
+    We treat the selected structural prior (Canny / Silhouette / Hybrid)
+    as the control image. This model expects:
+      - image (canny-like or structural map)
+      - prompt
+      - num_outputs
+      - guidance_scale
+      - image_resolution
+      - low_threshold, high_threshold
 
-    If you get schema errors from Replicate, check the model's API page
-    and tweak the keys in `input` accordingly.
+    NOTE: 'steps' is not exposed in this particular model's schema,
+    so we ignore it here to avoid 400/422 errors.
     """
     ensure_replicate_token()
 
+    # Prepare control image as PNG buffer
     control_image = resize_to_512(control_image)
     img_buf = pil_to_bytes_io(control_image)
 
-    # ControlNet parameters based on common jagilley/controlnet-canny schema.
+    # Call ControlNet model
     response = replicate.run(
         CONTROLNET_MODEL_ID,
         input={
             "image": img_buf,
             "prompt": prompt,
+            "num_outputs": num_outputs,
+            "guidance_scale": guidance_scale,
             "image_resolution": 512,
-            "ddim_steps": steps,
-            "scale": guidance_scale,
-            "num_samples": num_outputs,
             "low_threshold": 100,
             "high_threshold": 200,
-            "guess_mode": False,
         },
     )
 
+    # Normalise response → list of URL strings
     if isinstance(response, dict):
         urls = response.get("output", [])
     else:
