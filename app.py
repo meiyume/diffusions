@@ -72,6 +72,9 @@ def generate_thermo_variants(
     """
     Call Replicate's Stable Diffusion img2img model with Image B (thermography)
     and return a list of PIL Images (synthetic variants).
+    Handles both:
+    - plain list of URLs (common case for replicate.run)
+    - full prediction dict with an 'output' field
     """
     token = get_replicate_token()
     if not token:
@@ -87,9 +90,8 @@ def generate_thermo_variants(
     base_image = resize_to_512(base_image)
     img_buf = pil_to_bytes_io(base_image)
 
-    # Run model on Replicate
-    # NOTE: Different models can have slightly different inputs; these match the usual SD img2img schema.
-    output = replicate.run(
+    # Call Replicate
+    response = replicate.run(
         REPLICATE_MODEL_ID,
         input={
             "image": img_buf,
@@ -101,30 +103,31 @@ def generate_thermo_variants(
         },
     )
 
-    # Replicate typically returns a list of URLs (strings)
+    # Normalise response → list of URL strings
+    if isinstance(response, dict):
+        urls = response.get("output", [])
+    else:
+        urls = response
+
+    if not urls:
+        raise RuntimeError("Replicate returned no output URLs.")
+
     images: List[Image.Image] = []
-    for item in output:
-        if isinstance(item, str):
-            # Assume URL
-            resp = requests.get(item)
+    for url in urls:
+        try:
+            # Expect each item to be a URL string
+            resp = requests.get(str(url))
             resp.raise_for_status()
             img = Image.open(io.BytesIO(resp.content)).convert("RGB")
             images.append(img)
-        else:
-            # Fallback: if the object is already bytes-like (defensive)
-            try:
-                data = bytes(item)
-                img = Image.open(io.BytesIO(data)).convert("RGB")
-                images.append(img)
-            except Exception:
-                # Skip if can't decode
-                continue
+        except Exception as e:
+            # Non-fatal: just skip broken URLs but warn in UI
+            st.warning(f"Failed to load image from {url}: {e}")
 
     if not images:
-        raise RuntimeError("No images returned from Replicate.")
+        raise RuntimeError("Failed to download any images from Replicate output URLs.")
 
     return images
-
 
 # ------------------------------
 # Streamlit UI
